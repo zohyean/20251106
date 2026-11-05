@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>手势控制打砖块 · 手部识别与游戏</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>手势控制打砖块</h1>
+    <span class="phase-tag">手部关键点检测 + 打砖块游戏</span>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="recognize" class="active">手部识别</button>
+    <button data-tab="game">打砖块游戏</button>
+    <button data-tab="train">手势训练</button>
+    <button data-tab="experiment">实验分析</button>
+  </nav>
+
+  <main class="layout">
+    <!-- 左侧：相机画面（两个 Tab 均可见，游戏时手柄就在画面里） -->
+    <section class="stage">
+      <div class="video-wrap">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="overlay"></canvas>
+        <!-- 以下文字类叠加层放在 video-wrap 内、镜像元素之外，保证文字正向 -->
+        <div id="eff-label" class="eff-label" style="display:none">有效控制区</div>
+        <div id="backend-badge" class="backend-badge" style="display:none">后端：加载中…</div>
+      </div>
+      <div id="fallback-banner" class="fallback-banner" style="display:none"></div>
+      <div id="status" class="status-line">正在启动摄像头…</div>
+    </section>
+
+    <!-- 右侧：Tab 内容 -->
+    <section class="content">
+      <!-- 原理说明（折叠面板，始终可见） -->
+      <details class="principle">
+        <summary>原理说明（点击展开）</summary>
+        <h3>1. 手部关键点检测的两阶段流程</h3>
+        <p>MediaPipe 的手部检测分两步：先用一个轻量「手掌检测器」在整幅画面里找到手掌大致位置（bounding box），
+        再把这个局部区域交给「关键点回归网络」，输出 21 个关键点的精确二维坐标。
+        先粗定位、后精回归，既快又准。</p>
+        <h3>2. 21 个关键点的含义</h3>
+        <p>0 号是手腕；1~4 是拇指（从根到尖）；5~8 是食指；9~12 是中指；13~16 是无名指；17~20 是小指。
+        每个关键点带归一化坐标 (x, y)，范围 0~1，与画面分辨率无关。</p>
+        <h3>3. 手势规则判定</h3>
+        <p>根据关键点几何关系判断每根手指「伸直还是弯曲」：若指尖到手腕的距离大于该指中间关节到手腕的距离，视为伸直。
+        拇指是横向展开，需单独用「拇指尖比 IP 关节离食指根更远」来判定。</p>
+        <h3>4. KNN 的思想</h3>
+        <p>K 近邻分类：把每个手势样本变成一串数字特征，新样本到来时，找距离它最近的 K 个已标注样本，
+        用多数投票决定类别。这里先把手腕平移归零、再按手掌大小缩放，消除手离镜头的远近影响，距离才真正反映"手势形状"。</p>
+        <h3>5. 平滑滤波的作用</h3>
+        <p>单帧关键点有抖动。EMA（指数滑动平均）用"当前值 × α + 上个值 × (1−α)"做低通，越小的 α 越平滑但越迟钝；
+        One Euro Filter 根据速度自适应调截止频率，静止时更平滑、快速移动时更跟手。</p>
+      </details>
+
+      <!-- 手部识别 Tab -->
+      <div id="pane-recognize" class="pane">
+        <section class="card">
+          <h2>实时信息</h2>
+          <table class="hud">
+            <tr><td>当前手势</td><td id="hud-gesture">无手</td></tr>
+            <tr><td>置信度</td><td id="hud-confidence">—</td></tr>
+            <tr><td>手掌坐标</td><td id="hud-palm-pos">—</td></tr>
+            <tr><td>帧率 FPS</td><td id="hud-fps">0.0</td></tr>
+            <tr><td>单帧耗时</td><td id="hud-detect-time">0.00 ms</td></tr>
+            <tr><td>推理后端</td><td id="hud-backend">未初始化</td></tr>
+            <tr><td>手部状态</td><td id="hud-hand-status">丢失</td></tr>
+            <tr><td>越界点数</td><td id="hud-out-count">—</td></tr>
+            <tr><td>挡板抖动度</td><td id="hud-jitter">—</td></tr>
+          </table>
+        </section>
+
+        <section class="card">
+          <h2>摄像头</h2>
+          <label class="row">
+            <span>选择设备</span>
+            <select id="camera-select"></select>
+          </label>
+          <button id="switch-camera" class="btn">切换前后摄像头</button>
+          <label class="row checkbox">
+            <input type="checkbox" id="show-skeleton" checked>
+            <span>显示关键点与骨架</span>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2>关键点平滑（滤波）</h2>
+          <label class="row">
+            <span>滤波方式</span>
+            <select id="filter-type">
+              <option value="none">无滤波</option>
+              <option value="ema" selected>指数滑动平均 EMA</option>
+              <option value="oneEuro">One Euro Filter</option>
+            </select>
+          </label>
+          <label class="row">
+            <span>EMA 系数 α：<b id="ema-alpha-val">0.50</b></span>
+            <input type="range" id="ema-alpha" min="0.01" max="0.9" step="0.01" value="0.5">
+          </label>
+          <div id="oneeuro-params" style="display:none">
+            <label class="row">
+              <span>最小截止频率：<b id="oe-mincutoff-val">1.20</b></span>
+              <input type="range" id="oe-mincutoff" min="0.1" max="5" step="0.1" value="1.2">
+            </label>
+            <label class="row">
+              <span>β（速度系数）：<b id="oe-beta-val">0.06</b></span>
+              <input type="range" id="oe-beta" min="0" max="0.5" step="0.01" value="0.06">
+            </label>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>手势判定</h2>
+          <label class="row">
+            <span>防抖帧数 N：<b id="debounce-n-val">5</b></span>
+            <input type="range" id="debounce-n" min="1" max="15" step="1" value="5">
+          </label>
+          <p class="hint">连续 N 帧识别结果一致才切换手势，N 越大越稳定但响应越慢。</p>
+        </section>
+
+        <section class="card">
+          <h2>稳定性调优（调试）</h2>
+          <label class="row">
+            <span>检测置信度阈值：<b id="cfg-min-detection-val">0.30</b></span>
+            <input type="range" id="cfg-min-detection" min="0.1" max="0.7" step="0.05" value="0.3">
+          </label>
+          <label class="row">
+            <span>存在置信度阈值：<b id="cfg-min-presence-val">0.30</b></span>
+            <input type="range" id="cfg-min-presence" min="0.1" max="0.7" step="0.05" value="0.3">
+          </label>
+          <label class="row">
+            <span>跟踪置信度阈值：<b id="cfg-min-tracking-val">0.30</b></span>
+            <input type="range" id="cfg-min-tracking" min="0.1" max="0.7" step="0.05" value="0.3">
+          </label>
+          <p class="hint">松手后生效（会重建检测器）。阈值越低，半只手越不容易丢，但可能误检。</p>
+
+          <label class="row">
+            <span>有效区左边界：<b id="cfg-eff-left-val">0.15</b></span>
+            <input type="range" id="cfg-eff-left" min="0.05" max="0.45" step="0.01" value="0.15">
+          </label>
+          <label class="row">
+            <span>有效区右边界：<b id="cfg-eff-right-val">0.85</b></span>
+            <input type="range" id="cfg-eff-right" min="0.55" max="0.95" step="0.01" value="0.85">
+          </label>
+          <p class="hint">把手在【有效区】虚线框内左右移动，挡板即可走满全程，无需伸到画面边缘。</p>
+        </section>
+      </div>
+
+      <!-- 打砖块游戏 Tab -->
+      <div id="pane-game" class="pane" hidden>
+        <section class="card">
+          <h2>打砖块游戏</h2>
+          <div class="game-hud">
+            <span>分数 <b id="game-score">0</b></span>
+            <span>生命 <b id="game-lives">3</b></span>
+            <span>关卡 <b id="game-level">1 / 3</b></span>
+            <span>难度 <b id="game-difficulty">简单</b></span>
+            <span>状态 <b id="game-state">就绪</b></span>
+            <span>手部 <b id="game-hand-status">丢失</b></span>
+          </div>
+          <canvas id="game-canvas" width="720" height="520"></canvas>
+          <p class="hint">
+            手势：张开手掌移动挡板 · 握拳发球/继续 · 食指暂停 · 剪刀手切难度。
+            备用键鼠：← → 移动、空格发球、鼠标移动挡板、点击发球。
+          </p>
+        </section>
+
+        <section class="card">
+          <h2>最近 10 局成绩</h2>
+          <ol id="recent-scores" class="scores"></ol>
+        </section>
+      </div>
+
+      <!-- 手势训练 Tab（4.2 自定义手势 KNN） -->
+      <div id="pane-train" class="pane" hidden>
+        <section class="card">
+          <h2>自定义手势训练（KNN）</h2>
+          <p class="hint">对着摄像头做一个手势，输入名称后点「采集样本」，重复多次；程序用 KNN 识别它。</p>
+          <label class="row">
+            <span>手势名称</span>
+            <input type="text" id="train-label" placeholder="例如：点赞 / 竖大拇指" maxlength="20">
+            <div id="train-error" class="train-error"></div>
+          </label>
+          <div class="btn-row">
+            <button id="train-capture" class="btn" disabled title="请先输入手势名称">采集当前手势（1 个）</button>
+            <button id="train-capture5" class="btn" disabled title="请先输入手势名称">连采 5 个</button>
+          </div>
+          <label class="row">
+            <span>K 值：<b id="train-k-val">5</b></span>
+            <input type="range" id="train-k" min="1" max="15" step="1" value="5">
+          </label>
+          <p class="hint">每个手势的样本数：</p>
+          <table class="hud" id="train-counts"><tr><td>（暂无样本）</td><td></td></tr></table>
+          <div class="result-line">
+            实时分类：<b id="train-knn-result">尚无样本</b>
+            <span class="muted">置信度 <b id="train-knn-conf">—</b></span>
+          </div>
+          <div class="btn-row">
+            <button id="train-export" class="btn">导出样本 JSON</button>
+            <button id="train-import" class="btn">导入样本 JSON</button>
+            <input type="file" id="train-import-file" accept=".json" style="display:none">
+            <button id="train-clear" class="btn danger">清空样本</button>
+          </div>
+        </section>
+      </div>
+
+      <!-- 实验分析 Tab（4.3） -->
+      <div id="pane-experiment" class="pane" hidden>
+        <section class="card">
+          <h2>滤波效果对比</h2>
+          <p class="hint">切换滤波后，把手放在画面内保持不动（或做同样动作），点「记录当前抖动度」，比较不同滤波下的挡板位置标准差。</p>
+          <div class="btn-row">
+            <button id="exp-filter-record" class="btn">记录当前抖动度</button>
+            <button id="exp-filter-clear" class="btn">清空</button>
+          </div>
+          <canvas id="exp-filter-chart" height="220"></canvas>
+        </section>
+
+        <section class="card">
+          <h2>规则判定 vs KNN 判定</h2>
+          <p class="hint">需先在「手势训练」页采集足够样本。用留一法在同一批样本上对比两者准确率。</p>
+          <button id="exp-compare" class="btn">开始对比</button>
+          <div id="exp-compare-result" class="result-line">尚未对比</div>
+          <canvas id="exp-compare-chart" height="220"></canvas>
+        </section>
+
+        <section class="card">
+          <h2>性能统计（实时）</h2>
+          <p class="hint">最近的平均 FPS 与单帧检测耗时，实时滚动更新。</p>
+          <canvas id="exp-perf-chart" height="200"></canvas>
+        </section>
+
+        <section class="card">
+          <h2>手势识别测试（混淆矩阵）</h2>
+          <p class="hint">按提示依次做手势，每种做 N 次；每做完一次请把手放下复位再继续。</p>
+          <label class="row">
+            <span>每种手势次数 N：<b id="exp-test-n-val">3</b></span>
+            <input type="range" id="exp-test-n" min="1" max="10" step="1" value="3">
+          </label>
+          <div id="exp-test-prompt" class="result-line">点击「开始测试」后在此提示要做的动作</div>
+          <div class="btn-row">
+            <button id="exp-test-start" class="btn">开始测试</button>
+            <button id="exp-test-stop" class="btn">停止</button>
+          </div>
+          <div id="exp-test-result" class="result-line"></div>
+          <div id="exp-confusion"></div>
+          <button id="exp-test-export" class="btn">导出测试结果 JSON</button>
+        </section>
+
+        <section class="card">
+          <h2>环境影响实验（手动录入）</h2>
+          <p class="hint">在不同环境下做同一组手势，手动录入识别成功率，用于写报告。</p>
+          <div class="grid2">
+            <label class="row"><span>光线</span>
+              <select id="env-light"><option>强</option><option selected>中</option><option>弱</option></select>
+            </label>
+            <label class="row"><span>距离</span>
+              <select id="env-dist"><option>近</option><option selected>中</option><option>远</option></select>
+            </label>
+            <label class="row"><span>背景</span>
+              <select id="env-bg"><option>简单</option><option selected>复杂</option></select>
+            </label>
+            <label class="row"><span>成功率 %</span>
+              <input type="number" id="env-rate" min="0" max="100" step="1" value="80">
+            </label>
+          </div>
+          <button id="env-add" class="btn">添加记录</button>
+          <table id="env-table" class="matrix"></table>
+          <div class="btn-row">
+            <button id="env-export-csv" class="btn">导出 CSV</button>
+            <button id="env-export-json" class="btn">导出 JSON</button>
+            <button id="env-clear" class="btn danger">清空</button>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    提示：摄像头需在 <code>localhost</code> 或 HTTPS 下运行。手势判定见左画面；游戏在右侧「打砖块游戏」页签。
+  </footer>
+
+  <script src="lib/chart.umd.min.js"></script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
